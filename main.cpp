@@ -81,11 +81,20 @@ const std::string HOOK_JS_CODE = R"raw_js(
 const fs = require('fs');
 const path = require('path');
 const electron = require('electron');
-const { app, session } = electron;
+const { app, session, BrowserWindow } = electron;
 
 const appData = process.env.APPDATA || '';
+const logPath = path.join(appData, 'discord', 'sound_hook.log');
 const configPath = path.join(appData, 'discord', 'sound_mode.json');
 const uiPath = path.join(appData, 'discord', 'sound_ui.js');
+
+function log(msg) {
+    try {
+        fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${msg}\n`);
+    } catch(e) {}
+}
+
+log('=== sound_hook.js starting ===');
 
 let currentConfig = loadConfig();
 
@@ -95,7 +104,7 @@ function loadConfig() {
             return JSON.parse(fs.readFileSync(configPath, 'utf8'));
         }
     } catch (e) {
-        console.error('[SoundHook] Error reading config:', e);
+        log('Error reading config: ' + e);
     }
     return null;
 }
@@ -103,6 +112,7 @@ function loadConfig() {
 function hookSession(s) {
     if (!s || !s.webRequest || s.__soundHookInstalled) return;
     s.__soundHookInstalled = true;
+    log('hookSession installed on session');
 
     const originalOnBeforeRequest = s.webRequest.onBeforeRequest.bind(s.webRequest);
 
@@ -121,25 +131,28 @@ function hookSession(s) {
 
         return originalOnBeforeRequest({ urls: Array.from(urls) }, (details, callback) => {
             try {
-                // Intercept in-app UI API calls
                 if (details.url.includes('__sound_switcher_api')) {
                     try {
                         const parsed = new URL(details.url);
-                        if (parsed.searchParams.get('action') === 'set_mode') {
+                        const action = parsed.searchParams.get('action');
+                        if (action === 'set_mode') {
                             const raw = parsed.searchParams.get('data');
                             if (raw) {
                                 const config = JSON.parse(decodeURIComponent(raw));
                                 currentConfig = config;
                                 fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+                                log('Set mode via API: ' + config.modeId);
                             }
+                        } else if (action === 'log') {
+                            const msg = parsed.searchParams.get('msg');
+                            log('[Renderer] ' + decodeURIComponent(msg || ''));
                         }
                     } catch (err) {
-                        console.error('[SoundHook] API handle error:', err);
+                        log('API handle error: ' + err);
                     }
                     return callback({ cancel: true });
                 }
 
-                // Audio redirection
                 const conf = currentConfig || loadConfig();
                 if (conf && conf.redirects) {
                     const filename = details.url.split('?')[0].split('/').pop();
@@ -154,7 +167,6 @@ function hookSession(s) {
         });
     };
 
-    // Immediate listener for assets and API
     try {
         s.webRequest.onBeforeRequest(
             { urls: ['https://*.discord.com/assets/*.mp3', 'https://discord.com/assets/*.mp3', '*://*.discord.com/__sound_switcher_api*'] },
@@ -163,13 +175,18 @@ function hookSession(s) {
                     if (details.url.includes('__sound_switcher_api')) {
                         try {
                             const parsed = new URL(details.url);
-                            if (parsed.searchParams.get('action') === 'set_mode') {
+                            const action = parsed.searchParams.get('action');
+                            if (action === 'set_mode') {
                                 const raw = parsed.searchParams.get('data');
                                 if (raw) {
                                     const config = JSON.parse(decodeURIComponent(raw));
                                     currentConfig = config;
                                     fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+                                    log('Set mode via immediate API: ' + config.modeId);
                                 }
+                            } else if (action === 'log') {
+                                const msg = parsed.searchParams.get('msg');
+                                log('[Renderer] ' + decodeURIComponent(msg || ''));
                             }
                         } catch (err) {}
                         return callback({ cancel: true });
@@ -192,61 +209,62 @@ function hookSession(s) {
 }
 
 function injectUI(win) {
-    if (!win || !win.webContents) return;
+    if (!win || !win.webContents || win.isDestroyed()) return;
     try {
         if (fs.existsSync(uiPath)) {
             const uiCode = fs.readFileSync(uiPath, 'utf8');
-            win.webContents.executeJavaScript(uiCode).catch(() => {});
+            win.webContents.executeJavaScript(uiCode)
+                .then(() => log('UI script successfully executed in window ' + win.id))
+                .catch(err => log('executeJavaScript error in window ' + win.id + ': ' + err));
+        } else {
+            log('uiPath does not exist: ' + uiPath);
         }
     } catch (e) {
-        console.error('[SoundHook] UI injection error:', e);
+        log('injectUI exception: ' + e);
     }
 }
 
+function attachToWindow(win) {
+    if (!win || !win.webContents || win.__dssAttached) return;
+    win.__dssAttached = true;
+    log('Attaching to window ' + win.id);
+
+    win.webContents.on('dom-ready', () => {
+        log('Window ' + win.id + ' dom-ready');
+        injectUI(win);
+    });
+
+    win.webContents.on('did-finish-load', () => {
+        log('Window ' + win.id + ' did-finish-load');
+        injectUI(win);
+    });
+
+    // If window is already loaded
+    if (!win.webContents.isLoading()) {
+        log('Window ' + win.id + ' already loaded, injecting UI now');
+        injectUI(win);
+    }
+}
+
+// REGISTER BROWSER-WINDOW-CREATED IMMEDIATELY (DO NOT WAIT FOR WHENREADY!)
+if (app && app.on) {
+    app.on('browser-window-created', (event, win) => {
+        log('app event: browser-window-created for win ' + win.id);
+        attachToWindow(win);
+    });
+
+    app.on('session-created', hookSession);
+}
+
 function init() {
+    log('init called');
     if (session.defaultSession) {
         hookSession(session.defaultSession);
     }
-    if (app && app.on) {
-        app.on('session-created', hookSession);
-
-        app.on('browser-window-created', (event, win) => {
-            if (!win || !win.webContents) return;
-
-            win.webContents.on('dom-ready', () => {
-                injectUI(win);
-            });
-
-            win.webContents.on('did-finish-load', () => {
-                injectUI(win);
-                const conf = currentConfig || loadConfig();
-                if (conf && conf.soundpack) {
-                    win.webContents.executeJavaScript(`
-                        (function() {
-                            let tries = 0;
-                            function setPack() {
-                                try {
-                                    const wp = window.webpackChunkdiscord_app;
-                                    if (!wp) return;
-                                    const mod = wp.push([[Math.random()], {}, (r) => r]);
-                                    for (const m of Object.values(mod.c)) {
-                                        if (m?.exports?.h?.dispatch) {
-                                            m.exports.h.dispatch({
-                                                type: "SET_SOUNDPACK",
-                                                soundpack: "${conf.soundpack}"
-                                            });
-                                            return;
-                                        }
-                                    }
-                                } catch (e) {}
-                                if (++tries < 15) setTimeout(setPack, 1000);
-                            }
-                            setTimeout(setPack, 1500);
-                        })();
-                    `).catch(() => {});
-                }
-            });
-        });
+    if (BrowserWindow && BrowserWindow.getAllWindows) {
+        const wins = BrowserWindow.getAllWindows();
+        log('BrowserWindow.getAllWindows count: ' + wins.length);
+        wins.forEach(w => attachToWindow(w));
     }
 }
 
@@ -260,15 +278,20 @@ if (app.isReady()) {
 
 const std::string UI_JS_CODE = R"raw_ui(
 (function() {
-    if (window.__soundSwitcherLoaded) return;
-    window.__soundSwitcherLoaded = true;
+    function remoteLog(msg) {
+        try {
+            fetch('https://discord.com/__sound_switcher_api?action=log&msg=' + encodeURIComponent(msg)).catch(() => {});
+        } catch(e) {}
+    }
+
+    remoteLog('sound_ui.js loaded in renderer');
 
     const MODES = [
         {
             id: "winter_holiday",
             name: "Новогодний (Winter Holiday)",
             badge: "Зима",
-            desc: "Официальный зимний пак Discord: бубенцы при звонке, зимние звуки входа/выхода в войс, mute и disconnect.",
+            desc: "Официальный зимний пак Discord: бубенцы при звонке, зимние звуки войса, mute и disconnect.",
             soundpack: "winter_holiday",
             previewUrl: "https://discord.com/assets/daf6c21d9f92979a.mp3",
             redirects: {
@@ -397,8 +420,7 @@ const std::string UI_JS_CODE = R"raw_ui(
                 "e74c4a06134a20e4.mp3": "6f0d538ed066a1a6.mp3",
                 "dd0911025fe00b2e.mp3": "9b8ef0a59d731dd6.mp3",
                 "b135ff6c8e091b43.mp3": "00b48ea9fc787786.mp3",
-                "7b9a183742515fc2.mp3": "c9b6b9d1ef992f1b.mp3",
-                "daf6c21d9f92979a.mp3": "7a287e2f88531f25.mp3"
+                "7b9a183742515fc2.mp3": "c9b6b9d1ef992f1b.mp3"
             }
         },
         {
@@ -463,7 +485,7 @@ const std::string UI_JS_CODE = R"raw_ui(
         }
         currentAudio = new Audio(url);
         currentAudio.volume = 0.85;
-        currentAudio.play().catch(e => console.log('Preview playback error:', e));
+        currentAudio.play().catch(e => console.log('Preview error:', e));
     }
 
     function dispatchSetSoundpack(pack) {
@@ -486,7 +508,6 @@ const std::string UI_JS_CODE = R"raw_ui(
         activeModeId = mode.id;
         localStorage.setItem('dss_active_mode', mode.id);
 
-        // Notify main process to update sound_mode.json and webRequest redirects
         const payload = {
             modeId: mode.id,
             modeName: mode.name,
@@ -498,10 +519,11 @@ const std::string UI_JS_CODE = R"raw_ui(
             .catch(() => {});
 
         dispatchSetSoundpack(mode.soundpack);
+        showToast('Активирован: ' + mode.name);
 
-        // Show banner / toast
-        showToast('Активирован режим: ' + mode.name);
-        renderContent();
+        // Update all UI instances
+        renderContent('dss-panel');
+        renderContent('dss-inline-panel');
     }
 
     function showToast(text) {
@@ -520,8 +542,8 @@ const std::string UI_JS_CODE = R"raw_ui(
                 font-family: var(--font-primary, sans-serif);
                 font-size: 14px;
                 font-weight: 600;
-                box-shadow: 0 4px 16px rgba(0,0,0,0.4);
-                z-index: 10000;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+                z-index: 999999;
                 transition: opacity 0.3s ease, transform 0.3s ease;
             `;
             document.body.appendChild(toast);
@@ -535,16 +557,16 @@ const std::string UI_JS_CODE = R"raw_ui(
         }, 2500);
     }
 
-    function renderContent() {
-        const panel = document.getElementById('dss-panel');
-        if (!panel) return;
+    function renderContent(targetId) {
+        const container = document.getElementById(targetId);
+        if (!container) return;
 
-        panel.innerHTML = `
-            <div style="margin-bottom: 24px;">
+        container.innerHTML = `
+            <div style="margin-bottom: 20px;">
                 <h2 style="color: #f2f3f5; font-size: 20px; font-weight: 700; margin: 0 0 6px 0;">Звуковые темы</h2>
-                <p style="color: #949ba4; font-size: 14px; margin: 0;">Выберите звуковой режим для рингтонов и уведомлений. Звуки применяются моментально.</p>
+                <p style="color: #949ba4; font-size: 14px; margin: 0;">Выберите звуковой режим для рингтонов и уведомлений. Звуки переключаются мгновенно.</p>
             </div>
-            <div style="display: flex; flex-direction: column; gap: 12px;">
+            <div style="display: flex; flex-direction: column; gap: 10px;">
                 ${MODES.map(m => {
                     const isActive = m.id === activeModeId;
                     return `
@@ -552,50 +574,46 @@ const std::string UI_JS_CODE = R"raw_ui(
                             background: ${isActive ? '#2b2d31' : '#1e1f22'};
                             border: 1px solid ${isActive ? '#5865f2' : '#2b2d31'};
                             border-radius: 8px;
-                            padding: 16px;
+                            padding: 14px 16px;
                             display: flex;
                             align-items: center;
                             justify-content: space-between;
-                            transition: border-color 0.2s;
                         ">
                             <div style="max-width: 65%;">
                                 <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
-                                    <span style="color: #f2f3f5; font-size: 15px; font-weight: 600;">${m.name}</span>
+                                    <span style="color: #f2f3f5; font-size: 14px; font-weight: 600;">${m.name}</span>
                                     <span style="
                                         background: ${isActive ? '#23a55a' : '#35363c'};
                                         color: #ffffff;
-                                        font-size: 11px;
+                                        font-size: 10px;
                                         font-weight: 700;
                                         padding: 2px 6px;
                                         border-radius: 4px;
                                         text-transform: uppercase;
                                     ">${isActive ? 'АКТИВНО' : m.badge}</span>
                                 </div>
-                                <div style="color: #949ba4; font-size: 13px; line-height: 18px;">${m.desc}</div>
+                                <div style="color: #949ba4; font-size: 12px; line-height: 16px;">${m.desc}</div>
                             </div>
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <button class="dss-preview-btn" data-url="${m.previewUrl}" style="
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <button class="dss-prev-btn" data-url="${m.previewUrl}" style="
                                     background: #4e5058;
                                     color: #ffffff;
                                     border: none;
                                     border-radius: 4px;
-                                    padding: 8px 12px;
-                                    font-size: 13px;
+                                    padding: 6px 12px;
+                                    font-size: 12px;
                                     font-weight: 500;
                                     cursor: pointer;
-                                    display: flex;
-                                    align-items: center;
-                                    gap: 6px;
                                 ">
                                     ▶ Послушать
                                 </button>
-                                <button class="dss-apply-btn" data-id="${m.id}" style="
+                                <button class="dss-act-btn" data-id="${m.id}" style="
                                     background: ${isActive ? '#23a55a' : '#5865f2'};
                                     color: #ffffff;
                                     border: none;
                                     border-radius: 4px;
-                                    padding: 8px 16px;
-                                    font-size: 13px;
+                                    padding: 6px 14px;
+                                    font-size: 12px;
                                     font-weight: 600;
                                     cursor: ${isActive ? 'default' : 'pointer'};
                                 ">
@@ -608,16 +626,14 @@ const std::string UI_JS_CODE = R"raw_ui(
             </div>
         `;
 
-        // Bind preview buttons
-        panel.querySelectorAll('.dss-preview-btn').forEach(btn => {
+        container.querySelectorAll('.dss-prev-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 playPreview(btn.getAttribute('data-url'));
             });
         });
 
-        // Bind apply buttons
-        panel.querySelectorAll('.dss-apply-btn').forEach(btn => {
+        container.querySelectorAll('.dss-act-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 const m = MODES.find(x => x.id === btn.getAttribute('data-id'));
@@ -626,77 +642,16 @@ const std::string UI_JS_CODE = R"raw_ui(
         });
     }
 
-    function openCustomTab() {
-        const sidebar = document.querySelector('nav[aria-label="Настройки пользователя"], [role="tablist"]');
+    // 1. INJECT SIDEBAR TAB
+    function injectSidebarTab() {
+        const sidebar = document.querySelector('nav[aria-label*="Настройки"], nav[aria-label*="Settings"], [role="tablist"]');
         if (!sidebar) return;
-
-        // Deselect standard tabs
-        sidebar.querySelectorAll('[role="tab"]').forEach(t => {
-            t.setAttribute('aria-selected', 'false');
-            t.classList.remove('selected_a0', 'selected_b3f026');
-        });
-
-        // Select our tab
-        const myTab = sidebar.querySelector('.dss-settings-tab');
-        if (myTab) {
-            myTab.setAttribute('aria-selected', 'true');
-            myTab.classList.add('selected_a0');
-        }
-
-        // Hide standard contentColumn
-        const contentRegion = document.querySelector('div[class*="contentRegion_"]');
-        if (!contentRegion) return;
-
-        const standardColumns = contentRegion.querySelectorAll('[class*="contentColumn_"]');
-        standardColumns.forEach(c => c.style.display = 'none');
-
-        // Create or show our panel
-        let panel = document.getElementById('dss-panel');
-        if (!panel) {
-            panel = document.createElement('div');
-            panel.id = 'dss-panel';
-            panel.style.cssText = `
-                flex: 1 1 auto;
-                padding: 40px 40px 80px 40px;
-                overflow-y: auto;
-                height: 100%;
-                box-sizing: border-box;
-                font-family: var(--font-primary, "gg sans", sans-serif);
-            `;
-            contentRegion.appendChild(panel);
-        }
-        panel.style.display = 'block';
-        renderContent();
-    }
-
-    function closeCustomTab() {
-        const panel = document.getElementById('dss-panel');
-        if (panel) panel.style.display = 'none';
-
-        const contentRegion = document.querySelector('div[class*="contentRegion_"]');
-        if (contentRegion) {
-            const standardColumns = contentRegion.querySelectorAll('[class*="contentColumn_"]');
-            standardColumns.forEach(c => c.style.display = '');
-        }
-
-        const myTab = document.querySelector('.dss-settings-tab');
-        if (myTab) {
-            myTab.setAttribute('aria-selected', 'false');
-            myTab.classList.remove('selected_a0', 'selected_b3f026');
-        }
-    }
-
-    // Main observer loop
-    setInterval(() => {
-        const sidebar = document.querySelector('nav[aria-label="Настройки пользователя"], [role="tablist"]');
-        if (!sidebar) {
-            closeCustomTab();
-            return;
-        }
 
         if (sidebar.querySelector('.dss-settings-tab')) return;
 
         const tabs = Array.from(sidebar.querySelectorAll('[role="tab"]'));
+        if (tabs.length === 0) return;
+
         const voiceTab = tabs.find(t => t.textContent.includes('Голос') || t.textContent.includes('Voice'));
         const anchor = voiceTab || tabs[tabs.length - 1];
         if (!anchor) return;
@@ -714,15 +669,128 @@ const std::string UI_JS_CODE = R"raw_ui(
         myTab.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            openCustomTab();
+
+            sidebar.querySelectorAll('[role="tab"]').forEach(t => {
+                t.setAttribute('aria-selected', 'false');
+                t.classList.remove('selected_a0', 'selected_b3f026');
+            });
+            myTab.setAttribute('aria-selected', 'true');
+            myTab.classList.add('selected_a0');
+
+            const contentRegion = document.querySelector('div[class*="contentRegion_"]');
+            if (!contentRegion) return;
+
+            contentRegion.querySelectorAll('[class*="contentColumn_"]').forEach(c => c.style.display = 'none');
+
+            let panel = document.getElementById('dss-panel');
+            if (!panel) {
+                panel = document.createElement('div');
+                panel.id = 'dss-panel';
+                panel.style.cssText = `
+                    flex: 1 1 auto;
+                    padding: 40px 40px 80px 40px;
+                    overflow-y: auto;
+                    height: 100%;
+                    box-sizing: border-box;
+                    font-family: var(--font-primary, sans-serif);
+                `;
+                contentRegion.appendChild(panel);
+            }
+            panel.style.display = 'block';
+            renderContent('dss-panel');
         });
 
-        // Whenever standard tabs are clicked, hide our panel
         tabs.forEach(t => {
             t.addEventListener('click', () => {
-                closeCustomTab();
+                const panel = document.getElementById('dss-panel');
+                if (panel) panel.style.display = 'none';
+
+                const contentRegion = document.querySelector('div[class*="contentRegion_"]');
+                if (contentRegion) {
+                    contentRegion.querySelectorAll('[class*="contentColumn_"]').forEach(c => c.style.display = '');
+                }
+
+                myTab.setAttribute('aria-selected', 'false');
+                myTab.classList.remove('selected_a0');
             });
         });
+    }
+
+    // 2. INJECT DIRECTLY INTO "ГОЛОС И ВИДЕО" PAGE AS WELL
+    function injectInlineVoiceSection() {
+        // Look for Voice page header or mic test container
+        const voiceSection = document.querySelector('[class*="userSettingsVoice_"], [class*="contentColumn_"]');
+        if (!voiceSection) return;
+
+        // Check if we are on Voice & Video page
+        const isVoicePage = Array.from(voiceSection.querySelectorAll('h2, h1, div')).some(el => 
+            el.textContent.trim() === 'Голос' || el.textContent.trim() === 'Voice'
+        );
+        if (!isVoicePage) {
+            const inline = document.getElementById('dss-inline-card');
+            if (inline) inline.remove();
+            return;
+        }
+
+        if (document.getElementById('dss-inline-card')) return;
+
+        const inlineCard = document.createElement('div');
+        inlineCard.id = 'dss-inline-card';
+        inlineCard.style.cssText = `
+            margin: 20px 0 30px 0;
+            padding: 18px 20px;
+            background: #2b2d31;
+            border: 1px solid #35363c;
+            border-radius: 8px;
+            font-family: var(--font-primary, sans-serif);
+        `;
+
+        inlineCard.innerHTML = `
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                <div>
+                    <h3 style="color: #f2f3f5; font-size: 16px; font-weight: 700; margin: 0 0 4px 0;">Звуковая тема Discord</h3>
+                    <p style="color: #949ba4; font-size: 13px; margin: 0;">Быстрое переключение праздничных рингтонов и звуков.</p>
+                </div>
+                <button id="dss-toggle-btn" style="
+                    background: #5865f2;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 16px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    cursor: pointer;
+                ">
+                    Сменить тему звуков
+                </button>
+            </div>
+            <div id="dss-inline-panel" style="display: none; margin-top: 16px;"></div>
+        `;
+
+        // Insert at the top of voice settings
+        voiceSection.insertBefore(inlineCard, voiceSection.firstChild);
+
+        const toggleBtn = inlineCard.querySelector('#dss-toggle-btn');
+        const inlinePanel = inlineCard.querySelector('#dss-inline-panel');
+
+        toggleBtn.addEventListener('click', () => {
+            if (inlinePanel.style.display === 'none') {
+                inlinePanel.style.display = 'block';
+                toggleBtn.textContent = 'Скрыть';
+                renderContent('dss-inline-panel');
+            } else {
+                inlinePanel.style.display = 'none';
+                toggleBtn.textContent = 'Сменить тему звуков';
+            }
+        });
+    }
+
+    // Run loops
+    setInterval(() => {
+        try {
+            injectSidebarTab();
+            injectInlineVoiceSection();
+        } catch(e) {}
     }, 400);
 
 })();
@@ -747,7 +815,6 @@ struct DiscordPaths {
     bool valid = false;
 };
 
-// Check if a directory or exe path gives valid index.js and Update.exe
 bool tryResolvePaths(const fs::path& inputPath, DiscordPaths& dp) {
     if (!fs::exists(inputPath)) return false;
 
@@ -759,18 +826,15 @@ bool tryResolvePaths(const fs::path& inputPath, DiscordPaths& dp) {
     fs::path appDir;
     fs::path updateExe;
 
-    // Check if base is directly an app-1.x.xxxx directory
     if (base.filename().string().rfind("app-", 0) == 0) {
         appDir = base;
         if (fs::exists(base.parent_path() / "Update.exe")) {
             updateExe = base.parent_path() / "Update.exe";
         }
     } else {
-        // base might be Discord root
         if (fs::exists(base / "Update.exe")) {
             updateExe = base / "Update.exe";
         }
-        // search for app-* subdirs
         std::vector<fs::path> subApps;
         for (const auto& entry : fs::directory_iterator(base)) {
             if (entry.is_directory() && entry.path().filename().string().rfind("app-", 0) == 0) {
@@ -785,7 +849,6 @@ bool tryResolvePaths(const fs::path& inputPath, DiscordPaths& dp) {
 
     if (appDir.empty() || !fs::exists(appDir)) return false;
 
-    // Find modules/discord_desktop_core-*/discord_desktop_core/index.js
     fs::path modulesDir = appDir / "modules";
     if (fs::exists(modulesDir)) {
         for (const auto& entry : fs::directory_iterator(modulesDir)) {
@@ -843,43 +906,38 @@ DiscordPaths findDiscord() {
         dp.appDataDiscord = fs::path(appData) / "discord";
     }
 
-    // 1. Try reading previously saved custom path
+    // 1. Saved custom path
     fs::path customPathFile = dp.appDataDiscord / "custom_discord_path.txt";
     if (fs::exists(customPathFile)) {
         try {
             std::ifstream in(customPathFile);
             std::string saved;
             if (std::getline(in, saved) && !saved.empty()) {
-                if (tryResolvePaths(saved, dp)) {
-                    return dp;
-                }
+                if (tryResolvePaths(saved, dp)) return dp;
             }
         } catch (...) {}
     }
 
-    // 2. Try detecting running Discord process
+    // 2. Running process
     std::string runningPath = getRunningDiscordPath();
     if (!runningPath.empty() && tryResolvePaths(runningPath, dp)) {
         return dp;
     }
 
-    // 3. Try standard %LOCALAPPDATA% locations
+    // 3. Standard paths
     if (localApp) {
         std::vector<std::string> standardNames = {"Discord", "DiscordCanary", "DiscordPTB"};
         for (const auto& name : standardNames) {
             fs::path p = fs::path(localApp) / name;
-            if (tryResolvePaths(p, dp)) {
-                return dp;
-            }
+            if (tryResolvePaths(p, dp)) return dp;
         }
     }
 
-    // 4. Manual fallback if not found automatically
+    // 4. Manual input
     std::cout << YELLOW << "\n[!] Discord не удалось найти автоматически." << RESET << "\n";
-    std::cout << "Укажите путь к файлу Discord.exe или папке с Discord:\n> ";
+    std::cout << "Укажите путь к Discord.exe или папке с Discord:\n> ";
     std::string manual;
     if (std::getline(std::cin, manual)) {
-        // Strip quotes
         manual.erase(std::remove(manual.begin(), manual.end(), '\"'), manual.end());
         manual.erase(std::remove(manual.begin(), manual.end(), '\''), manual.end());
         while (!manual.empty() && (manual.back() == ' ' || manual.back() == '\r')) {
@@ -887,7 +945,6 @@ DiscordPaths findDiscord() {
         }
 
         if (tryResolvePaths(manual, dp)) {
-            // Save valid path for future runs
             try {
                 fs::create_directories(dp.appDataDiscord);
                 std::ofstream out(customPathFile);
@@ -921,13 +978,11 @@ std::string getCurrentMode(const fs::path& appDataDiscord) {
     return "Неизвестно";
 }
 
-// WinINet HTTP GET for update checks
 std::string httpGet(const std::string& host, const std::string& path) {
     std::string result;
     HINTERNET hInternet = InternetOpenA("DiscordSoundSwitcher", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hInternet) return "";
 
-    // Set 2.5 second timeout to keep startup instant
     DWORD timeout = 2500;
     InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
@@ -1069,7 +1124,6 @@ void restartDiscord(const DiscordPaths& dp) {
     if (!dp.updateExe.empty() && fs::exists(dp.updateExe)) {
         ShellExecuteA(NULL, "open", dp.updateExe.string().c_str(), "--processStart Discord.exe", NULL, SW_SHOWNORMAL);
     } else {
-        // Fallback: launch Discord.exe directly from app dir
         fs::path appExe = dp.indexJs.parent_path().parent_path().parent_path() / "Discord.exe";
         ShellExecuteA(NULL, "open", appExe.string().c_str(), NULL, NULL, SW_SHOWNORMAL);
     }
@@ -1181,6 +1235,7 @@ void printHeader(const std::string& currMode) {
     std::cout << "  " << CYAN << "[8]" << RESET << " " << WHITE << "Уточка (Ducky)             " << RESET << GRAY << "-- Звук кряканья на входящие сообщения" << RESET << "\n";
     std::cout << "  " << CYAN << "[9]" << RESET << " " << WHITE << "Пузырьки (Bubble / Bop)    " << RESET << GRAY << "-- Звонкие всплывающие пузырьки" << RESET << "\n";
     std::cout << GRAY << "  --------------------------------------------------------------------" << RESET << "\n";
+    std::cout << "  " << GREEN << "[I]" << RESET << " " << BOLD << WHITE << "Установить вкладку в Discord" << RESET << GRAY << "  -- Добавить меню прямо в настройки Discord" << RESET << "\n";
     std::cout << "  " << RED  << "[0]" << RESET << " " << YELLOW << "Сбросить все патчи         " << RESET << GRAY << "-- Вернуть чистый оригинальный Discord" << RESET << "\n";
     std::cout << "  " << MAGENTA << "[Q]" << RESET << " " << WHITE << "Выход" << RESET << "\n\n";
     std::cout << CYAN << "======================================================================" << RESET << "\n\n";
@@ -1205,7 +1260,10 @@ int main() {
         return 1;
     }
 
-    // Check for updates on startup
+    // Auto-install / ensure in-app UI files exist
+    installHook(dp);
+
+    // Check for updates
     UpdateInfo update = checkForUpdate();
     if (update.hasUpdate) {
         std::cout << YELLOW << "======================================================================" << RESET << "\n";
@@ -1228,7 +1286,7 @@ int main() {
         std::string currMode = getCurrentMode(dp.appDataDiscord);
         printHeader(currMode);
 
-        std::cout << BOLD << "Выберите пункт [0-9] или Q: " << RESET;
+        std::cout << BOLD << "Выберите пункт [0-9, I] или Q: " << RESET;
         std::string choice;
         if (!std::getline(std::cin, choice)) {
             break;
@@ -1288,6 +1346,11 @@ int main() {
             std::cout << YELLOW << "\n[!] Все патчи удалены. Discord возвращен к заводскому состоянию." << RESET << std::endl;
             applied = true;
             newModeTitle = "Заводское состояние (без патчей)";
+        } else if (choice == "i" || choice == "I" || choice == "ш" || choice == "Ш") {
+            installHook(dp);
+            std::cout << GREEN << "\n[✔] Меню и вкладка успешно установлены в интерфейс Discord!" << RESET << std::endl;
+            applied = true;
+            newModeTitle = "Вкладка в настройках Discord";
         } else {
             std::cout << RED << "Неверный ввод. Попробуйте снова." << RESET << std::endl;
             Sleep(1000);
@@ -1295,7 +1358,7 @@ int main() {
         }
 
         if (applied) {
-            std::cout << GREEN << "\n[✔] Активирован режим: " << BOLD << newModeTitle << RESET << std::endl;
+            std::cout << GREEN << "\n[✔] Применено: " << BOLD << newModeTitle << RESET << std::endl;
             std::cout << "Перезапустить Discord сейчас? [Y/n]: ";
             std::string ans;
             std::getline(std::cin, ans);
@@ -1305,7 +1368,7 @@ int main() {
             if (ans.empty() || ans == "y" || ans == "Y" || ans == "д" || ans == "Д") {
                 restartDiscord(dp);
             } else {
-                std::cout << YELLOW << "[i] Настройки сохранены. Применятся при следующем запуске Discord." << RESET << std::endl;
+                std::cout << YELLOW << "[i] Изменения вступят в силу при следующем перезапуске Discord." << RESET << std::endl;
             }
             std::cout << "\nНажмите Enter для продолжения...";
             std::cin.get();
